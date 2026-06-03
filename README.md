@@ -1,0 +1,1 @@
+# uralstore-xd-bot
