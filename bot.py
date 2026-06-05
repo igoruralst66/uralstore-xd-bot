@@ -2,124 +2,290 @@ import os
 import json
 import logging
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
-)
+
 import gspread
 from google.oauth2.service_account import Credentials
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    ContextTypes, filters,
+)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Этапы диалога
-DATE, CLIENT_TYPE, NAME, TOPIC, WHAT_SAID, IMPRESSION, NEXT_STEP, WHO_LED = range(8)
+# ---------- НАСТРОЙКИ ДОСТУПА ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+SHEET_ID = "1Dzce99k7q3yD9oUSGw0bziPjpMo8WBDDLPpwHB6nECg"
 
-def get_sheet():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    creds_dict = json.loads(creds_json)
-    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key("1Dzce99k7q3yD9oUSGw0bziPjpMo8WBDDLPpwHB6nECg")
-    return sheet.sheet1
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+gc = gspread.authorize(creds)
+spreadsheet = gc.open_by_key(SHEET_ID)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Записываем опыт клиента 📋\n\nКакая дата звонка? (например: 04.06.2025)",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return DATE
+# ---------- СПРАВОЧНИКИ (по умолчанию, если лист Настройки пуст) ----------
+СЧЕТА = ["Касса", "Альфа", "Т-Банк"]
+КОМАНДА = ["Старший менеджер", "Менеджер дист.", "Консультант"]
+ПОСТАВЩИКИ = ["Урал Прайс", "ApplePrice", "Appleman", "Хохряков 72", "Параллельный импорт", "Другое"]
 
-async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["date"] = update.message.text
-    keyboard = [["B2B", "B2C"]]
-    await update.message.reply_text(
-        "Тип клиента?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return CLIENT_TYPE
+# Категория -> (тип, создаёт долг?)
+КАТЕГОРИИ = {
+    "Приём наличных":            ("Приход", None),
+    "Оплата на юр.":             ("Приход", None),
+    "Приём дебиторки":           ("Приход", "гасит_дебиторку"),
+    "Рассрочка (первый взнос)":  ("Приход", "создаёт_дебиторку"),
+    "Trade-in":                  ("Приход", None),
+    "Поступил товар в долг":     ("Расход", "создаёт_кредиторку"),
+    "Выдача денег поставщику":   ("Расход", "гасит_кредиторку"),
+    "Выдача налички":            ("Расход", None),
+    "Нами выдано":               ("Расход", None),
+    "Возврат":                   ("Расход", None),
+}
 
-async def get_client_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["client_type"] = update.message.text
-    await update.message.reply_text("Имя или компания клиента?", reply_markup=ReplyKeyboardRemove())
-    return NAME
+# ---------- ЭТАПЫ ДИАЛОГА ----------
+(КАТЕГОРИЯ, СУММА, СЧЁТ, БАНК_ПОСТ, КЛИЕНТ, ОСТАТОК, КТО, КОММЕНТ) = range(8)
 
-async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
-    await update.message.reply_text("Тема звонка?")
-    return TOPIC
 
-async def get_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["topic"] = update.message.text
-    await update.message.reply_text("Что сказал клиент? (кратко, своими словами)")
-    return WHAT_SAID
+# ---------- АВТОСОЗДАНИЕ ЛИСТОВ ----------
+def ensure_sheets():
+    titles = [ws.title for ws in spreadsheet.worksheets()]
 
-async def get_what_said(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["what_said"] = update.message.text
-    keyboard = [["1", "2", "3", "4", "5"]]
-    await update.message.reply_text(
-        "Впечатление от звонка (1 — плохо, 5 — отлично)?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
-    )
-    return IMPRESSION
+    if "Операции" not in titles:
+        ws = spreadsheet.add_worksheet("Операции", rows=1000, cols=8)
+        ws.append_row(["Дата", "Тип", "Сумма", "Счёт", "Категория",
+                       "Клиент / Поставщик", "Кто провёл", "Комментарий"])
+    if "Долги" not in titles:
+        ws = spreadsheet.add_worksheet("Долги", rows=1000, cols=6)
+        ws.append_row(["Дата", "Кто/Кому", "Тип долга", "Сумма", "Статус", "Комментарий"])
+    if "Настройки" not in titles:
+        ws = spreadsheet.add_worksheet("Настройки", rows=50, cols=4)
+        ws.append_row(["Счета", "Команда", "Категория", "Тип"])
+        rows = []
+        maxlen = max(len(СЧЕТА), len(КОМАНДА), len(КАТЕГОРИИ))
+        cats = list(КАТЕГОРИИ.items())
+        for i in range(maxlen):
+            acc = СЧЕТА[i] if i < len(СЧЕТА) else ""
+            team = КОМАНДА[i] if i < len(КОМАНДА) else ""
+            cat = cats[i][0] if i < len(cats) else ""
+            typ = cats[i][1][0] if i < len(cats) else ""
+            rows.append([acc, team, cat, typ])
+        ws.append_rows(rows)
+    if "Итого" not in titles:
+        ws = spreadsheet.add_worksheet("Итого", rows=30, cols=3)
+        data = [
+            ["ИТОГО — состояние компании", "", ""],
+            ["Касса", '=SUMIFS(Операции!C:C;Операции!D:D;"Касса";Операции!B:B;"Приход")-SUMIFS(Операции!C:C;Операции!D:D;"Касса";Операции!B:B;"Расход")', ""],
+            ["Альфа", '=SUMIFS(Операции!C:C;Операции!D:D;"Альфа";Операции!B:B;"Приход")-SUMIFS(Операции!C:C;Операции!D:D;"Альфа";Операции!B:B;"Расход")', ""],
+            ["Т-Банк", '=SUMIFS(Операции!C:C;Операции!D:D;"Т-Банк";Операции!B:B;"Приход")-SUMIFS(Операции!C:C;Операции!D:D;"Т-Банк";Операции!B:B;"Расход")', ""],
+            ["ДЕНЬГИ ВСЕГО", "=SUM(B2:B4)", ""],
+            ["Товар на складе (ввожу сам)", 0, "меняю вручную"],
+            ["Нам должны (дебиторка)", '=SUMIFS(Долги!D:D;Долги!C:C;"Нам должны (дебиторка)";Долги!E:E;"Висит")', ""],
+            ["Мы должны", '=SUMIFS(Долги!D:D;Долги!C:C;"Мы должны (поставщику)";Долги!E:E;"Висит")+SUMIFS(Долги!D:D;Долги!C:C;"Мы должны (заём)";Долги!E:E;"Висит")', ""],
+            ["КАПИТАЛ КОМПАНИИ", "=B5+B6+B7-B8", "Деньги+Товар+Дебиторка−Долги"],
+        ]
+        ws.append_rows(data, value_input_option="USER_ENTERED")
 
-async def get_impression(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["impression"] = update.message.text
-    await update.message.reply_text("Следующий шаг?", reply_markup=ReplyKeyboardRemove())
-    return NEXT_STEP
 
-async def get_next_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["next_step"] = update.message.text
-    await update.message.reply_text("Кто вёл звонок?")
-    return WHO_LED
-
-async def get_who_led(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["who_led"] = update.message.text
-    data = context.user_data
+def read_settings():
+    """Читает справочники из листа Настройки (пульт). Если не получилось — дефолт."""
+    global СЧЕТА, КОМАНДА
     try:
-        sheet = get_sheet()
-        sheet.append_row([
-            data.get("date"),
-            data.get("client_type"),
-            data.get("name"),
-            data.get("topic"),
-            data.get("what_said"),
-            data.get("impression"),
-            data.get("next_step"),
-            data.get("who_led"),
-            datetime.now().strftime("%d.%m.%Y %H:%M")
-        ])
-        await update.message.reply_text("✅ Записано в таблицу! Спасибо.\n\nНовый звонок? /start")
+        ws = spreadsheet.worksheet("Настройки")
+        records = ws.get_all_values()[1:]  # без шапки
+        accs = [r[0] for r in records if len(r) > 0 and r[0].strip()]
+        team = [r[1] for r in records if len(r) > 1 and r[1].strip()]
+        if accs:
+            СЧЕТА = accs
+        if team:
+            КОМАНДА = team
     except Exception as e:
-        logger.error(f"Ошибка записи: {e}")
-        await update.message.reply_text(f"❌ Ошибка записи: {e}")
+        logging.warning(f"settings read failed: {e}")
+
+
+def kb(options, cols=2):
+    rows, row = [], []
+    for o in options:
+        row.append(o)
+        if len(row) == cols:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+# ---------- ДИАЛОГ ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    read_settings()
+    context.user_data.clear()
+    await update.message.reply_text(
+        "💰 Новая операция. Выбери категорию:",
+        reply_markup=kb(list(КАТЕГОРИИ.keys()), cols=2),
+    )
+    return КАТЕГОРИЯ
+
+
+async def cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat = update.message.text.strip()
+    if cat not in КАТЕГОРИИ:
+        await update.message.reply_text("Выбери категорию кнопкой.")
+        return КАТЕГОРИЯ
+    context.user_data["Категория"] = cat
+    context.user_data["Тип"], context.user_data["Долг"] = КАТЕГОРИИ[cat]
+    await update.message.reply_text("Сумма? (числом, например 95000)",
+                                    reply_markup=ReplyKeyboardRemove())
+    return СУММА
+
+
+async def sum_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.replace(" ", "").replace(",", ".")
+    try:
+        amount = float(raw)
+    except ValueError:
+        await update.message.reply_text("Не похоже на число. Введи сумму ещё раз.")
+        return СУММА
+    context.user_data["Сумма"] = amount
+    долг = context.user_data["Долг"]
+
+    # Если товар от поставщика — спрашиваем поставщика
+    if долг in ("создаёт_кредиторку", "гасит_кредиторку"):
+        await update.message.reply_text("Поставщик?", reply_markup=kb(ПОСТАВЩИКИ, cols=2))
+        return БАНК_ПОСТ
+    # Иначе спрашиваем счёт
+    await update.message.reply_text("На какой счёт / с какого счёта?",
+                                    reply_markup=kb(СЧЕТА, cols=3))
+    return СЧЁТ
+
+
+async def supplier_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["Клиент"] = update.message.text.strip()
+    await update.message.reply_text("С какого счёта деньги? (или на какой)",
+                                    reply_markup=kb(СЧЕТА, cols=3))
+    return СЧЁТ
+
+
+async def account_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    acc = update.message.text.strip()
+    if acc not in СЧЕТА:
+        await update.message.reply_text("Выбери счёт кнопкой.")
+        return СЧЁТ
+    context.user_data["Счёт"] = acc
+    # клиент уже есть (если был поставщик) — пропускаем
+    if "Клиент" in context.user_data:
+        await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=1))
+        return КТО
+    await update.message.reply_text("Клиент / ФИО? (или напиши «-» если нет)",
+                                    reply_markup=ReplyKeyboardRemove())
+    return КЛИЕНТ
+
+
+async def client_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["Клиент"] = update.message.text.strip()
+    долг = context.user_data["Долг"]
+    # Рассрочка — спросим полную сумму сделки, чтобы посчитать остаток-долг
+    if долг == "создаёт_дебиторку":
+        await update.message.reply_text(
+            "Полная сумма сделки? (остаток уйдёт в долг клиента). Если долга нет — введи ту же сумму."
+        )
+        return ОСТАТОК
+    await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=1))
+    return КТО
+
+
+async def full_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.replace(" ", "").replace(",", ".")
+    try:
+        full = float(raw)
+    except ValueError:
+        await update.message.reply_text("Введи число.")
+        return ОСТАТОК
+    context.user_data["Остаток_долга"] = max(0.0, full - context.user_data["Сумма"])
+    await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=1))
+    return КТО
+
+
+async def who_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    who = update.message.text.strip()
+    if who not in КОМАНДА:
+        await update.message.reply_text("Выбери кнопкой.")
+        return КТО
+    context.user_data["Кто"] = who
+    await update.message.reply_text("Комментарий? (или «-»)",
+                                    reply_markup=ReplyKeyboardRemove())
+    return КОММЕНТ
+
+
+async def comment_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data
+    d["Комментарий"] = update.message.text.strip()
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    # 1) Пишем операцию
+    spreadsheet.worksheet("Операции").append_row([
+        date, d["Тип"], d["Сумма"], d["Счёт"], d["Категория"],
+        d.get("Клиент", "-"), d["Кто"], d["Комментарий"],
+    ], value_input_option="USER_ENTERED")
+
+    # 2) Если есть долг — пишем в лист Долги
+    долг = d["Долг"]
+    долги_ws = spreadsheet.worksheet("Долги")
+    if долг == "создаёт_кредиторку":
+        долги_ws.append_row([date, d.get("Клиент", "-"), "Мы должны (поставщику)",
+                             d["Сумма"], "Висит", d["Комментарий"]],
+                            value_input_option="USER_ENTERED")
+    elif долг == "создаёт_дебиторку" and d.get("Остаток_долга", 0) > 0:
+        долги_ws.append_row([date, d.get("Клиент", "-"), "Нам должны (дебиторка)",
+                             d["Остаток_долга"], "Висит", "остаток по рассрочке"],
+                            value_input_option="USER_ENTERED")
+
+    # Сводка пользователю
+    txt = (f"✅ Записано!\n\n"
+           f"{d['Тип']} {d['Сумма']:.0f} ₽\n"
+           f"Счёт: {d['Счёт']}\n"
+           f"Категория: {d['Категория']}\n"
+           f"Клиент: {d.get('Клиент','-')}\n"
+           f"Провёл: {d['Кто']}")
+    if долг == "создаёт_кредиторку":
+        txt += f"\n\n📌 Долг поставщику {d['Сумма']:.0f} ₽ записан."
+    elif долг == "создаёт_дебиторку" and d.get("Остаток_долга", 0) > 0:
+        txt += f"\n\n📌 Клиент должен {d['Остаток_долга']:.0f} ₽ — записано."
+    txt += "\n\n/start — новая операция"
+    await update.message.reply_text(txt, reply_markup=ReplyKeyboardRemove())
+    context.user_data.clear()
     return ConversationHandler.END
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено. Начать заново: /start", reply_markup=ReplyKeyboardRemove())
+    context.user_data.clear()
+    await update.message.reply_text("Отменено. /start — начать заново.",
+                                    reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
+
 def main():
-    token = os.environ.get("BOT_TOKEN")
-    app = Application.builder().token(token).build()
-    conv_handler = ConversationHandler(
+    ensure_sheets()
+    read_settings()
+    app = Application.builder().token(BOT_TOKEN).build()
+    conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_date)],
-            CLIENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_client_type)],
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_topic)],
-            WHAT_SAID: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_what_said)],
-            IMPRESSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_impression)],
-            NEXT_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_next_step)],
-            WHO_LED: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_who_led)],
+            КАТЕГОРИЯ: [MessageHandler(filters.TEXT & ~filters.COMMAND, cat_chosen)],
+            СУММА:     [MessageHandler(filters.TEXT & ~filters.COMMAND, sum_entered)],
+            БАНК_ПОСТ: [MessageHandler(filters.TEXT & ~filters.COMMAND, supplier_chosen)],
+            СЧЁТ:      [MessageHandler(filters.TEXT & ~filters.COMMAND, account_chosen)],
+            КЛИЕНТ:    [MessageHandler(filters.TEXT & ~filters.COMMAND, client_entered)],
+            ОСТАТОК:   [MessageHandler(filters.TEXT & ~filters.COMMAND, full_amount_entered)],
+            КТО:       [MessageHandler(filters.TEXT & ~filters.COMMAND, who_chosen)],
+            КОММЕНТ:   [MessageHandler(filters.TEXT & ~filters.COMMAND, comment_and_save)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    app.add_handler(conv_handler)
+    app.add_handler(conv)
+    logging.info("Bot started")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
