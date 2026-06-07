@@ -37,7 +37,6 @@ spreadsheet = gc.open_by_key(SHEET_ID)
 КАТЕГОРИИ = {
     "Приём наличных":        ("Приход", None),
     "Оплата на юр.":         ("Приход", None),
-    "Приём дебиторки":       ("Приход", "гасит_дебиторку"),
     "Рассрочка":             ("Приход", "создаёт_дебиторку"),
     "Trade-in":              ("Приход", None),
     "Поступил товар в долг": ("Расход", "создаёт_кредиторку"),
@@ -225,6 +224,14 @@ async def cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb(["Наличка", "Устройство"], cols=2)
         )
         return ВЫДАНО_ТИП
+
+    # Возврат — сначала устройство и IMEI
+    if cat == "Возврат":
+        await update.message.reply_text(
+            "Модель устройства? (или «-» если не техника)",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return УСТРОЙСТВО
 
     await update.message.reply_text(
         "Сумма? (числом, например 95000)",
