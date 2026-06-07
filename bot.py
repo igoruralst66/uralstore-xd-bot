@@ -17,6 +17,9 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SHEET_ID = "1Dzce99k7q3yD9oUSGw0bziPjpMo8WBDDLPpwHB6nECg"
 
+# Твой Telegram ID — сюда будут приходить уведомления
+OWNER_ID = 8659182905
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -116,6 +119,38 @@ def kb(options, cols=2):
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+# ---------- УВЕДОМЛЕНИЕ ВЛАДЕЛЬЦУ ----------
+async def notify_owner(context: ContextTypes.DEFAULT_TYPE, d: dict):
+    """Отправляет уведомление владельцу после каждой операции."""
+    try:
+        тип_emoji = "🟢" if d["Тип"] == "Приход" else "🔴"
+        долг = d.get("Долг")
+
+        текст = (
+            f"{тип_emoji} *Новая операция — Урал Стор*\n\n"
+            f"*{d['Тип']}:* {d['Сумма']:.0f} ₽\n"
+            f"*Счёт:* {d['Счёт']}\n"
+            f"*Категория:* {d['Категория']}\n"
+            f"*Клиент/Поставщик:* {d.get('Клиент', '-')}\n"
+            f"*Провёл:* {d['Кто']}\n"
+            f"*Комментарий:* {d.get('Комментарий', '-')}\n"
+            f"*Время:* {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+
+        if долг == "создаёт_кредиторку":
+            текст += f"\n\n📌 Долг поставщику: {d['Сумма']:.0f} ₽"
+        elif долг == "создаёт_дебиторку" and d.get("Остаток_долга", 0) > 0:
+            текст += f"\n\n📌 Клиент должен: {d['Остаток_долга']:.0f} ₽"
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=текст,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить уведомление владельцу: {e}")
+
+
 # ---------- ДИАЛОГ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     read_settings()
@@ -149,11 +184,9 @@ async def sum_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["Сумма"] = amount
     долг = context.user_data["Долг"]
 
-    # Если товар от поставщика — спрашиваем поставщика
     if долг in ("создаёт_кредиторку", "гасит_кредиторку"):
         await update.message.reply_text("Поставщик?", reply_markup=kb(ПОСТАВЩИКИ, cols=2))
         return БАНК_ПОСТ
-    # Иначе спрашиваем счёт
     await update.message.reply_text("На какой счёт / с какого счёта?",
                                     reply_markup=kb(СЧЕТА, cols=3))
     return СЧЁТ
@@ -172,7 +205,6 @@ async def account_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выбери счёт кнопкой.")
         return СЧЁТ
     context.user_data["Счёт"] = acc
-    # клиент уже есть (если был поставщик) — пропускаем
     if "Клиент" in context.user_data:
         await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=1))
         return КТО
@@ -184,7 +216,6 @@ async def account_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def client_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["Клиент"] = update.message.text.strip()
     долг = context.user_data["Долг"]
-    # Рассрочка — спросим полную сумму сделки, чтобы посчитать остаток-долг
     if долг == "создаёт_дебиторку":
         await update.message.reply_text(
             "Полная сумма сделки? (остаток уйдёт в долг клиента). Если долга нет — введи ту же сумму."
@@ -239,6 +270,9 @@ async def comment_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         долги_ws.append_row([date, d.get("Клиент", "-"), "Нам должны (дебиторка)",
                              d["Остаток_долга"], "Висит", "остаток по рассрочке"],
                             value_input_option="USER_ENTERED")
+
+    # 3) Уведомление владельцу
+    await notify_owner(context, d)
 
     # Сводка пользователю
     txt = (f"✅ Записано!\n\n"
