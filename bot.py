@@ -30,7 +30,7 @@ gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SHEET_ID)
 
 # ---------- СПРАВОЧНИКИ ----------
-КОМАНДА = ["Старший менеджер", "Менеджер дист.", "Консультант"]
+КОМАНДА = ["Костя", "Серёжа", "Арман", "Игорь", "Анастасия", "Фарида", "Егор"]
 ПОСТАВЩИКИ = ["Урал Прайс", "ApplePrice", "Appleman", "Хохряков 72", "Параллельный импорт", "Другое"]
 
 # Категория -> (тип, создаёт долг?)
@@ -328,9 +328,13 @@ async def supplier_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def account_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["Счёт"] = update.message.text.strip()
+    счёт = update.message.text.strip()
+    if not счёт:
+        await update.message.reply_text("Введи название счёта.")
+        return СЧЁТ
+    context.user_data["Счёт"] = счёт
     if "Клиент" in context.user_data:
-        await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=1))
+        await update.message.reply_text("Кто провёл?", reply_markup=kb(КОМАНДА, cols=2))
         return КТО
     await update.message.reply_text(
         "Клиент / ФИО? (или «-» если нет)",
