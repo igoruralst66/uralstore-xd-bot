@@ -38,9 +38,8 @@ spreadsheet = gc.open_by_key(SHEET_ID)
     "Приём наличных":        ("Приход", None),
     "Оплата на юр.":         ("Приход", None),
     "Рассрочка":             ("Приход", "создаёт_дебиторку"),
-    "Trade-in":              ("Приход", None),
+    "Трейд-ин / Выкуп":     ("Приход", None),
     "Поступил товар в долг": ("Расход", "создаёт_кредиторку"),
-    "Выдача денег поставщику": ("Расход", "гасит_кредиторку"),
     "Выдача налички":        ("Расход", None),
     "Выдано в долг":         ("Расход", "создаёт_дебиторку_выдача"),
     "Возврат":               ("Расход", None),
@@ -210,7 +209,7 @@ async def cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["Тип"], context.user_data["Долг"] = КАТЕГОРИИ[cat]
 
     # Trade-in — особый сценарий
-    if cat == "Trade-in":
+    if cat == "Трейд-ин / Выкуп":
         await update.message.reply_text(
             "Модель устройства? (например: iPhone 13 Pro 256GB)",
             reply_markup=ReplyKeyboardRemove()
@@ -261,7 +260,7 @@ async def tradein_сумма(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def tradein_imei(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["IMEI"] = update.message.text.strip()
     await update.message.reply_text(
-        "Счёт? (например: Касса, Альфа, Т-Банк)",
+        "С какого счёта выплатили за устройство?\nНапример: Касса, Альфа, Т-Банк.\nЕсли зачтено в покупку — напиши «-»",
         reply_markup=ReplyKeyboardRemove()
     )
     return СЧЁТ
@@ -370,7 +369,10 @@ async def who_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выбери кнопкой.")
         return КТО
     context.user_data["Кто"] = who
-    await update.message.reply_text("Комментарий? (или «-»)", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "Комментарий? Например: поставщику Урал Прайс, клиенту Иванов, оплата заказа. Или «-»",
+        reply_markup=ReplyKeyboardRemove()
+    )
     return КОММЕНТ
 
 
